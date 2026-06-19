@@ -74,6 +74,8 @@ Each run creates `data/uv_lamp_log_YYYYMMDD_HHMMSS.csv`.
    Enter the lower and upper temperature limits in Celsius. During a run, the
    controller turns the lamp ON at or below the lower limit and OFF at or above
    the upper limit. The plot shades the active band and draws both limit lines.
+   Place the thermocouple as close as practical to the measurement target so the
+   controller responds to the temperature you actually care about.
 
 3. Choose the run timer
 
