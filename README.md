@@ -1,11 +1,12 @@
 # UV Lamp Controller
 
-Desktop BLE controller for a UV lamp with thermocouple feedback. The app
-connects to a BLE device named `ThermoCouple`, plots live temperature, controls
-the lamp within a lower/upper temperature band, and saves CSV logs to `data/`.
+Desktop BLE controller and Arduino firmware for a UV lamp with thermocouple
+feedback. The app connects to a BLE device named `ThermoCouple`, starts an
+onboard recipe, plots live temperature, and saves CSV logs to `data/`.
 
-This repository contains the desktop controller only. It assumes the hardware
-is already advertising the compatible BLE service below.
+The Arduino owns active recipes. Once a recipe is started, the board keeps the
+timer, temperature-band control, relay dwell, and UV-on counter running even if
+the laptop sleeps, the BLE link drops, or the app is closed.
 
 ![UV Lamp Controller GUI](docs/gui.png)
 
@@ -84,9 +85,13 @@ Each run creates `data/uv_lamp_log_YYYYMMDD_HHMMSS.csv`.
 
 4. Start, stop, or reset a run
 
-   `Start` begins a new run, clears the live table and plot, creates a CSV log,
-   and enters warm-up control. `Stop` turns the lamp OFF and closes the active
-   log. `Reset` clears the displayed data for the next run.
+   `Start` uploads a new recipe to the Arduino, clears the live table and plot,
+   creates a CSV log, and enters warm-up control on the board. `Stop` sends
+   `RECIPE_STOP`, turns the lamp OFF, and closes the active log. If the laptop
+   disconnects during a run, the recipe continues on the Arduino; reconnect to
+   monitor or stop it. Disconnecting or closing the app does not send a lamp
+   command, and closing the app during a run detaches from the recipe instead of
+   stopping it.
 
 5. Use manual lamp control
 
@@ -124,9 +129,20 @@ DATA,arduino_ms,thermocouple_C,internal_C,sensor_ok,fault_bits,raw,lamp
 The app sends:
 
 ```text
+RECIPE_START,lower_C,upper_C,duration_s,TOTAL
+RECIPE_START,lower_C,upper_C,duration_s,UV
+RECIPE_STOP
 LAMP_ON
 LAMP_OFF
 STATUS
+```
+
+Manual `LAMP_ON` and `LAMP_OFF` are accepted only while no recipe is running.
+`STATUS` returns a key/value line that lets the app reattach to an existing
+recipe:
+
+```text
+STATUS,relay_pin=7,lamp=ON,ble=CONNECTED,recipe=RUNNING,last=NONE,mode=TOTAL,lower=26.00,upper=30.00,duration_s=1800,elapsed_s=120,uv_on_s=82,remaining_s=1680,start_ms=12345,startup=0
 ```
 
 `arduino_ms` should be captured when the thermocouple is read. The plot and CSV

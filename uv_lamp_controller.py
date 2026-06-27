@@ -29,6 +29,7 @@ PROJECT_DIR = Path(__file__).resolve().parent
 DATA_DIR = PROJECT_DIR / "data"
 DEFAULT_CONTROL_AVERAGE_SAMPLES = 5
 DEFAULT_MIN_RELAY_DWELL_S = 1.0
+BLE_RECONNECT_DELAY_MS = 5000
 
 
 @dataclass
@@ -245,6 +246,8 @@ class UVLampControllerApp(tk.Tk):
         self.reader_thread: threading.Thread | None = None
         self.stop_event = threading.Event()
         self.polling_connection = False
+        self.auto_reconnect_after_id: str | None = None
+        self.timer_polling = False
         self.connection_queue: queue.Queue[tuple[str, str]] = queue.Queue()
 
         self.samples: list[Sample] = []
@@ -476,22 +479,27 @@ class UVLampControllerApp(tk.Tk):
         ttk.Label(frame, textvariable=variable, style="Metric.TLabel").pack(anchor="w")
 
     def toggle_connection(self) -> None:
-        if self.running:
-            return
-
         if self._is_connected():
-            self.disconnect_connection("Disconnected")
+            if self.running:
+                self._cancel_scheduled_reconnect()
+                self.disconnect_connection("Detached; recipe continues on Arduino", release_lamp=False)
+            else:
+                self.disconnect_connection("Disconnected")
         else:
             self.connect_ble()
 
-    def connect_ble(self) -> bool:
+    def connect_ble(self, show_error: bool = True, sync_status: bool = True) -> bool:
         if self._is_ble_connected():
+            if sync_status:
+                self._send_command("STATUS")
             return True
 
         if BleakClient is None or BleakScanner is None:
-            messagebox.showerror("Missing dependency", "Install bleak first:\n\npython -m pip install -r requirements.txt")
+            if show_error:
+                messagebox.showerror("Missing dependency", "Install bleak first:\n\npython -m pip install -r requirements.txt")
             return False
 
+        self._cancel_scheduled_reconnect()
         self._clear_connection_queue()
         self.stop_event.clear()
         self.ble_connected_event.clear()
@@ -512,11 +520,14 @@ class UVLampControllerApp(tk.Tk):
         if self._is_ble_connected():
             self.status_var.set(f"Connected to {self.connected_port or BLE_DEVICE_NAME}")
             self._update_connection_controls()
+            if sync_status:
+                self._send_command("STATUS")
             return True
 
         reason = self.ble_connect_error or f"Could not find {BLE_DEVICE_NAME} over BLE."
         self.disconnect_connection(reason, release_lamp=False)
-        messagebox.showerror("BLE connection", reason)
+        if show_error:
+            messagebox.showerror("BLE connection", reason)
         return False
 
     def _ble_thread_loop(self) -> None:
@@ -578,11 +589,8 @@ class UVLampControllerApp(tk.Tk):
         if not self.stop_event.is_set():
             self.connection_queue.put(("error", "BLE disconnected"))
 
-    def disconnect_connection(self, reason: str, release_lamp: bool = True) -> None:
-        if self.running:
-            self.stop_run(reason)
-
-        if release_lamp and self._is_connected():
+    def disconnect_connection(self, reason: str, release_lamp: bool = False) -> None:
+        if release_lamp and not self.running and self._is_connected():
             self.set_lamp(True, force=True)
             if self._is_ble_connected():
                 time.sleep(0.15)
@@ -605,8 +613,9 @@ class UVLampControllerApp(tk.Tk):
         self.ble_connect_error = None
         self.connected_port = None
         self.reader_thread = None
-        self.last_lamp_command = None
-        self.lamp_var.set("ON" if release_lamp else "OFF")
+        if not self.running:
+            self.last_lamp_command = None
+            self.lamp_var.set("ON" if release_lamp else "OFF")
         self._clear_connection_queue()
         self._update_connection_controls()
         self.status_var.set(reason)
@@ -620,6 +629,28 @@ class UVLampControllerApp(tk.Tk):
     def _connection_name(self) -> str:
         return self.connected_port or BLE_DEVICE_NAME
 
+    def _cancel_scheduled_reconnect(self) -> None:
+        if self.auto_reconnect_after_id is not None:
+            try:
+                self.after_cancel(self.auto_reconnect_after_id)
+            except Exception:
+                pass
+            self.auto_reconnect_after_id = None
+
+    def _schedule_recipe_reconnect(self) -> None:
+        if not self.running or self._is_connected() or self.auto_reconnect_after_id is not None:
+            return
+        self.auto_reconnect_after_id = self.after(BLE_RECONNECT_DELAY_MS, self._attempt_recipe_reconnect)
+
+    def _attempt_recipe_reconnect(self) -> None:
+        self.auto_reconnect_after_id = None
+        if not self.running or self._is_connected():
+            return
+        self.status_var.set("Reconnecting to running recipe...")
+        if not self.connect_ble(show_error=False):
+            self.status_var.set("Recipe running on Arduino; reconnecting...")
+            self._schedule_recipe_reconnect()
+
     def _start_connection_polling(self) -> None:
         if not self.polling_connection:
             self.polling_connection = True
@@ -628,17 +659,49 @@ class UVLampControllerApp(tk.Tk):
     def _update_connection_controls(self) -> None:
         connected = self._is_connected()
 
-        self.connect_button.configure(text="Disconnect" if connected else "Connect")
         if self.running:
-            self.connect_button.state(["disabled"])
-        elif connected:
-            self.connect_button.state(["!disabled"])
+            self.connect_button.configure(text="Detach" if connected else "Reconnect")
         else:
-            self.connect_button.state(["!disabled"])
+            self.connect_button.configure(text="Disconnect" if connected else "Connect")
+        self.connect_button.state(["!disabled"])
 
         manual_state = ["!disabled"] if connected and not self.running else ["disabled"]
         self.manual_on_button.state(manual_state)
         self.manual_off_button.state(manual_state)
+        if self.running:
+            self.stop_button.state(["!disabled"] if connected else ["disabled"])
+
+    def _open_run_log(self) -> None:
+        if self.csv_handle is not None:
+            try:
+                self.csv_handle.flush()
+                self.csv_handle.close()
+            finally:
+                self.csv_handle = None
+                self.csv_writer = None
+
+        timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        DATA_DIR.mkdir(exist_ok=True)
+        self.log_path = DATA_DIR / f"uv_lamp_log_{timestamp}.csv"
+        self.csv_handle = self.log_path.open("w", newline="", encoding="utf-8")
+        self.csv_writer = csv.writer(self.csv_handle)
+        self.csv_writer.writerow(
+            [
+                "timestamp",
+                "elapsed_s",
+                "uv_on_s",
+                "goal_mode",
+                "arduino_ms",
+                "thermocouple_C",
+                "control_temp_C",
+                "internal_C",
+                "sensor_ok",
+                "fault_bits",
+                "raw",
+                "lamp",
+            ]
+        )
+        self.log_var.set(str(self.log_path))
 
     def start_run(self) -> None:
         if self.running:
@@ -665,9 +728,10 @@ class UVLampControllerApp(tk.Tk):
             messagebox.showerror("Run timer", "Set a timer longer than 0 seconds.")
             return
 
-        if not self.connect_ble():
+        if not self.connect_ble(sync_status=False):
             return
         port = self._connection_name()
+        self._clear_connection_queue()
 
         self.samples.clear()
         self.control_filter_values.clear()
@@ -679,28 +743,7 @@ class UVLampControllerApp(tk.Tk):
         self.plot.set_limits(lower, upper)
         self.plot.set_samples(self.samples)
 
-        timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-        DATA_DIR.mkdir(exist_ok=True)
-        self.log_path = DATA_DIR / f"uv_lamp_log_{timestamp}.csv"
-        self.csv_handle = self.log_path.open("w", newline="", encoding="utf-8")
-        self.csv_writer = csv.writer(self.csv_handle)
-        self.csv_writer.writerow(
-            [
-                "timestamp",
-                "elapsed_s",
-                "uv_on_s",
-                "goal_mode",
-                "arduino_ms",
-                "thermocouple_C",
-                "control_temp_C",
-                "internal_C",
-                "sensor_ok",
-                "fault_bits",
-                "raw",
-                "lamp",
-            ]
-        )
-        self.log_var.set(str(self.log_path))
+        self._open_run_log()
 
         self.running = True
         self.run_start = time.monotonic()
@@ -713,19 +756,24 @@ class UVLampControllerApp(tk.Tk):
         self.startup_heating = True
         self.last_lamp_change_s = 0.0
         self.last_lamp_command = None
-        self.status_var.set(f"Warm-up to upper on {port}")
+        self.status_var.set(f"Recipe running on Arduino via {port}")
         self.start_button.state(["disabled"])
         self.stop_button.state(["!disabled"])
         self._update_connection_controls()
         self.timer_var.set(self._format_duration(duration_s))
         self.uv_timer_var.set("00:00:00")
 
-        self.set_lamp(False, force=True)
-        self.last_lamp_change_s = 0.0
-        self.after(200, self._update_timer)
+        mode = self.goal_mode_var.get().upper()
+        self._send_command(f"RECIPE_START,{lower:.3f},{upper:.3f},{duration_s},{mode}")
+        self._send_command("STATUS")
+        self._start_timer_updates()
 
     def reset_run(self) -> None:
         if self.running:
+            if not self._is_connected():
+                self.status_var.set("Reconnect before stopping or resetting the Arduino recipe")
+                self._schedule_recipe_reconnect()
+                return
             self.stop_run("Reset")
         elif self._is_connected():
             self.set_lamp(False, force=True)
@@ -762,15 +810,7 @@ class UVLampControllerApp(tk.Tk):
         self.plot.set_samples(self.samples)
         self.status_var.set("Ready for next run")
 
-    def stop_run(self, reason: str) -> None:
-        was_running = self.running
-        if not was_running and not self._is_connected():
-            return
-
-        self.running = False
-        self.startup_heating = False
-        self.set_lamp(False, force=True)
-
+    def _close_run_log(self) -> None:
         if self.csv_handle is not None:
             try:
                 self.csv_handle.flush()
@@ -779,12 +819,36 @@ class UVLampControllerApp(tk.Tk):
                 self.csv_handle = None
                 self.csv_writer = None
 
+    def _finish_local_run(self, reason: str, lamp_state: str | None = None) -> None:
+        self._cancel_scheduled_reconnect()
+        self.running = False
+        self.startup_heating = False
+        self.uv_timer_var.set(self._format_duration(self._current_uv_on_s()))
+        self._close_run_log()
+
         self.start_button.state(["!disabled"])
         self.stop_button.state(["disabled"])
         self._update_connection_controls()
         self.status_var.set(reason)
-        self.lamp_var.set("OFF")
-        self.uv_timer_var.set(self._format_duration(self._current_uv_on_s()))
+        if lamp_state is not None:
+            self.lamp_var.set(lamp_state)
+            self.last_lamp_command = lamp_state
+
+    def stop_run(self, reason: str) -> None:
+        if self.running and not self._is_connected():
+            self.status_var.set("Reconnect before stopping the Arduino recipe")
+            self._schedule_recipe_reconnect()
+            return
+
+        if self.running:
+            self._send_command("RECIPE_STOP")
+            self._send_command("STATUS")
+            self._finish_local_run(reason, lamp_state="OFF")
+            return
+
+        if self._is_connected():
+            self.set_lamp(False, force=True)
+            self.status_var.set(reason)
 
     def manual_set_lamp(self, on: bool) -> None:
         if self.running:
@@ -881,9 +945,11 @@ class UVLampControllerApp(tk.Tk):
                 break
 
             if kind == "error":
-                if self.running:
-                    self.stop_run(f"Connection error: {payload}")
+                was_running = self.running
                 self.disconnect_connection(f"Connection error: {payload}", release_lamp=False)
+                if was_running:
+                    self.status_var.set("Connection lost; recipe continues on Arduino")
+                    self._schedule_recipe_reconnect()
                 return
 
             if kind == "status":
@@ -895,6 +961,8 @@ class UVLampControllerApp(tk.Tk):
         if not self._is_connected():
             self._clear_connection_queue()
             self.polling_connection = False
+            if self.running:
+                self._schedule_recipe_reconnect()
             return
 
         self.after(100, self._poll_connection_queue)
@@ -907,10 +975,135 @@ class UVLampControllerApp(tk.Tk):
                     self._record_sample(sample)
         elif line == "READY":
             self.status_var.set("Device ready")
+            self._send_command("STATUS")
+        elif line.startswith("STATUS,"):
+            self._handle_status_line(line)
+        elif line.startswith("RECIPE,"):
+            self._handle_recipe_event(line)
         elif line.startswith("ACK,"):
             self.status_var.set(line.replace(",", ": ", 1))
         elif line.startswith("ERR,"):
             self.status_var.set(line)
+
+    @staticmethod
+    def _parse_key_values(line: str) -> dict[str, str]:
+        values: dict[str, str] = {}
+        for part in line.split(",")[1:]:
+            if "=" not in part:
+                continue
+            key, value = part.split("=", 1)
+            values[key.strip().lower()] = value.strip()
+        return values
+
+    @staticmethod
+    def _float_value(values: dict[str, str], key: str) -> float | None:
+        try:
+            return float(values[key])
+        except (KeyError, ValueError):
+            return None
+
+    @staticmethod
+    def _int_value(values: dict[str, str], key: str) -> int | None:
+        try:
+            return int(float(values[key]))
+        except (KeyError, ValueError):
+            return None
+
+    def _handle_status_line(self, line: str) -> None:
+        values = self._parse_key_values(line)
+        lamp = values.get("lamp")
+        if lamp in {"ON", "OFF"}:
+            self.lamp_var.set(lamp)
+            if not self.running:
+                self.last_lamp_command = lamp
+
+        recipe_state = values.get("recipe")
+        if recipe_state == "RUNNING":
+            self._sync_running_recipe(values)
+            return
+
+        if self.running:
+            last_state = values.get("last")
+            reason = "Recipe complete" if last_state == "COMPLETE" else "Recipe stopped on Arduino"
+            self._finish_local_run(reason, lamp_state=lamp if lamp in {"ON", "OFF"} else "OFF")
+        elif recipe_state == "IDLE":
+            self.status_var.set("Connected; device idle")
+
+    def _handle_recipe_event(self, line: str) -> None:
+        values = self._parse_key_values(line)
+        uv_on_s = self._float_value(values, "uv_on_s")
+        if uv_on_s is not None:
+            self.uv_on_accumulated_s = uv_on_s
+            self.uv_on_since_s = None
+            self.uv_timer_var.set(self._format_duration(uv_on_s))
+
+        if line.startswith("RECIPE,DONE"):
+            self._finish_local_run("Recipe complete", lamp_state="OFF")
+        elif line.startswith("RECIPE,STOPPED"):
+            self._finish_local_run("Recipe stopped on Arduino", lamp_state="OFF")
+
+    def _sync_running_recipe(self, values: dict[str, str]) -> None:
+        now = time.monotonic()
+        elapsed_s = self._float_value(values, "elapsed_s") or 0.0
+        uv_on_s = self._float_value(values, "uv_on_s") or 0.0
+        remaining_s = self._float_value(values, "remaining_s")
+        duration_s = self._int_value(values, "duration_s")
+        lower = self._float_value(values, "lower")
+        upper = self._float_value(values, "upper")
+        start_ms = self._int_value(values, "start_ms")
+        lamp = values.get("lamp")
+        mode = values.get("mode", "TOTAL").lower()
+
+        if not self.running:
+            self.samples.clear()
+            self.control_filter_values.clear()
+            for item in self.table.get_children():
+                self.table.delete(item)
+            self.current_temp_var.set("--.-- C")
+            self.internal_temp_var.set("--.-- C")
+            self._open_run_log()
+
+        self.running = True
+        self.run_start = now - elapsed_s
+        self.goal_duration_s = duration_s if duration_s is not None else self.goal_duration_s
+        if remaining_s is not None:
+            self.timer_end = now + remaining_s
+        elif self.goal_duration_s > 0:
+            self.timer_end = now + max(0.0, self.goal_duration_s - elapsed_s)
+
+        if mode in {"total", "uv"}:
+            self.goal_mode_var.set(mode)
+        if duration_s is not None:
+            self._set_timer_fields(duration_s)
+        if lower is not None:
+            self.lower_var.set(f"{lower:.2f}")
+        if upper is not None:
+            self.upper_var.set(f"{upper:.2f}")
+        if lower is not None and upper is not None and lower < upper:
+            self.plot.set_limits(lower, upper)
+
+        self.sample_zero_arduino_ms = start_ms
+        self.sample_zero_wall_time = dt.datetime.now() - dt.timedelta(seconds=elapsed_s)
+        self.uv_on_accumulated_s = uv_on_s
+        self.uv_on_since_s = now if lamp == "ON" else None
+        self.last_lamp_command = lamp if lamp in {"ON", "OFF"} else self.last_lamp_command
+        self.startup_heating = values.get("startup") == "1"
+
+        self.start_button.state(["disabled"])
+        self.stop_button.state(["!disabled"] if self._is_connected() else ["disabled"])
+        self._update_connection_controls()
+        self.status_var.set("Recipe running on Arduino")
+        self.uv_timer_var.set(self._format_duration(self._current_uv_on_s(now)))
+        if remaining_s is not None:
+            self.timer_var.set(self._format_duration(remaining_s))
+        self._start_timer_updates()
+
+    def _set_timer_fields(self, duration_s: int) -> None:
+        hours, remainder = divmod(max(0, duration_s), 3600)
+        minutes, seconds = divmod(remainder, 60)
+        self.hours_var.set(str(hours))
+        self.minutes_var.set(str(minutes))
+        self.seconds_var.set(str(seconds))
 
     def _parse_sample(self, line: str) -> Sample | None:
         parts = line.split(",")
@@ -948,6 +1141,7 @@ class UVLampControllerApp(tk.Tk):
 
     def _record_sample(self, sample: Sample) -> None:
         self.samples.append(sample)
+        self._sync_lamp_from_sample(sample)
         control_temp = self._update_control_filter(sample)
         uv_on_s = self._current_uv_on_s()
         if self.csv_writer is not None and self.csv_handle is not None:
@@ -993,7 +1187,22 @@ class UVLampControllerApp(tk.Tk):
             self.table.delete(rows[-1])
 
         self.plot.set_samples(self.samples)
-        self._apply_temperature_control(sample, control_temp)
+
+    def _sync_lamp_from_sample(self, sample: Sample) -> None:
+        lamp_state = "ON" if sample.lamp == "ON" else "OFF"
+        now = time.monotonic()
+        if self.last_lamp_command is None:
+            self.last_lamp_command = lamp_state
+            if lamp_state == "ON" and self.uv_on_since_s is None:
+                self.uv_on_since_s = now
+            self.lamp_var.set(lamp_state)
+            return
+
+        if lamp_state != self.last_lamp_command:
+            self._track_uv_lamp_transition(lamp_state == "ON", now)
+            self.last_lamp_change_s = now
+            self.last_lamp_command = lamp_state
+        self.lamp_var.set(lamp_state)
 
     def _update_control_filter(self, sample: Sample) -> float | None:
         if not sample.ok or not math.isfinite(sample.thermocouple_c):
@@ -1006,38 +1215,14 @@ class UVLampControllerApp(tk.Tk):
 
         return sum(self.control_filter_values) / len(self.control_filter_values)
 
-    def _apply_temperature_control(self, sample: Sample, control_temp: float | None) -> None:
-        if not self.running:
-            return
-
-        try:
-            lower = float(self.lower_var.get())
-            upper = float(self.upper_var.get())
-        except ValueError:
-            self.set_lamp(False, force=True)
-            return
-
-        if not sample.ok:
-            self.startup_heating = False
-            self.set_lamp(False, force=True)
-            self.status_var.set("Sensor fault: lamp off")
-        elif control_temp is None:
-            self.set_lamp(False, force=True)
-        elif self.startup_heating:
-            if control_temp >= upper:
-                self.startup_heating = False
-                self.set_lamp(False, force=True)
-                self.status_var.set("Upper reached: band control")
-            else:
-                self.set_lamp(True)
-                self.status_var.set("Warm-up: heating to upper")
-        elif control_temp <= lower:
-            self.set_lamp(True)
-        elif control_temp >= upper:
-            self.set_lamp(False)
+    def _start_timer_updates(self) -> None:
+        if not self.timer_polling:
+            self.timer_polling = True
+            self.after(250, self._update_timer)
 
     def _update_timer(self) -> None:
         if not self.running:
+            self.timer_polling = False
             return
 
         now = time.monotonic()
@@ -1055,8 +1240,7 @@ class UVLampControllerApp(tk.Tk):
         self.timer_var.set(self._format_duration(remaining))
 
         if remaining_s <= 0:
-            self.stop_run(complete_reason)
-            return
+            self.status_var.set(f"{complete_reason}; waiting for Arduino status")
 
         self.after(250, self._update_timer)
 
@@ -1093,9 +1277,10 @@ class UVLampControllerApp(tk.Tk):
 
     def on_close(self) -> None:
         if self.running:
-            self.stop_run("Closed")
+            self._close_run_log()
+            self._cancel_scheduled_reconnect()
         if self._is_connected():
-            self.disconnect_connection("Closed")
+            self.disconnect_connection("Closed; recipe continues on Arduino" if self.running else "Closed", release_lamp=False)
         self.destroy()
 
 
