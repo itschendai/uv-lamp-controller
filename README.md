@@ -120,11 +120,17 @@ The app scans for either the local name `ThermoCouple` or this service UUID:
 | Data characteristic | `7f3fd101-9a7e-4f4f-a5f1-f6c5437fd801` (`READ`, `NOTIFY`) |
 | Command characteristic | `7f3fd102-9a7e-4f4f-a5f1-f6c5437fd801` (`WRITE`) |
 
-Data notifications use one line per sample:
+Live data notifications use one line per sample:
 
 ```text
-DATA,arduino_ms,thermocouple_C,internal_C,sensor_ok,fault_bits,raw,lamp
+DATA,arduino_ms,thermocouple_C,internal_C,sensor_ok,fault_bits,raw,lamp,uv_on_ms
 ```
+
+The Arduino also keeps a RAM-backed ring buffer of the most recent 600 recipe
+samples, about 10 minutes at the default 1 Hz sample rate. On reconnect, the app
+requests missed rows with `HISTORY_SINCE,last_arduino_ms`; replayed rows use the
+same sample fields with a `HIST` prefix. If the laptop is disconnected longer
+than the ring buffer covers, `HISTORY_BEGIN` reports `lost=1`.
 
 The app sends:
 
@@ -132,6 +138,7 @@ The app sends:
 RECIPE_START,lower_C,upper_C,duration_s,TOTAL
 RECIPE_START,lower_C,upper_C,duration_s,UV
 RECIPE_STOP
+HISTORY_SINCE,arduino_ms
 LAMP_ON
 LAMP_OFF
 STATUS
@@ -142,7 +149,7 @@ Manual `LAMP_ON` and `LAMP_OFF` are accepted only while no recipe is running.
 recipe:
 
 ```text
-STATUS,relay_pin=7,lamp=ON,ble=CONNECTED,recipe=RUNNING,last=NONE,mode=TOTAL,lower=26.00,upper=30.00,duration_s=1800,elapsed_s=120,uv_on_s=82,remaining_s=1680,start_ms=12345,startup=0
+STATUS,relay_pin=7,lamp=ON,ble=CONNECTED,recipe=RUNNING,last=NONE,mode=TOTAL,lower=26.00,upper=30.00,duration_s=1800,elapsed_s=120,uv_on_s=82,remaining_s=1680,start_ms=12345,startup=0,history_count=120,history_capacity=600
 ```
 
 `arduino_ms` should be captured when the thermocouple is read. The plot and CSV

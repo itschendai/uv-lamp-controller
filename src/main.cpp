@@ -15,9 +15,10 @@ constexpr char kBleLocalName[] = "ThermoCouple";
 constexpr char kBleServiceUuid[] = "7f3fd100-9a7e-4f4f-a5f1-f6c5437fd801";
 constexpr char kBleDataUuid[] = "7f3fd101-9a7e-4f4f-a5f1-f6c5437fd801";
 constexpr char kBleCommandUuid[] = "7f3fd102-9a7e-4f4f-a5f1-f6c5437fd801";
-constexpr uint8_t kBleDataLength = 244;
+constexpr uint16_t kBleDataLength = 300;
 constexpr uint8_t kBleCommandLength = 96;
 constexpr uint8_t kControlAverageSamples = 5;
+constexpr uint16_t kSampleHistoryCapacity = 600;  // 10 minutes at 1 Hz.
 constexpr unsigned long kMinRelayDwellMs = 1000;
 
 SPISettings max31855SpiSettings(
@@ -36,6 +37,17 @@ struct Max31855Reading {
   double internalC;
   uint8_t faultBits;
   uint32_t raw;
+};
+
+struct SampleRecord {
+  unsigned long sampleMs;
+  unsigned long uvOnMs;
+  float thermocoupleC;
+  float internalC;
+  uint32_t raw;
+  uint8_t faultBits;
+  bool ok;
+  bool lampOn;
 };
 
 enum class RecipeGoalMode {
@@ -76,6 +88,21 @@ unsigned long lastSampleMs = 0;
 bool bleReady = false;
 bool bleConnected = false;
 RecipeState recipe;
+SampleRecord sampleHistory[kSampleHistoryCapacity];
+uint16_t sampleHistoryStart = 0;
+uint16_t sampleHistoryCount = 0;
+
+String sampleLine(
+    const __FlashStringHelper* prefix,
+    unsigned long sampleMs,
+    double thermocoupleC,
+    double internalC,
+    bool ok,
+    uint8_t faultBits,
+    uint32_t raw,
+    bool sampleLampOn,
+    unsigned long uvOnMs);
+void emitHistorySince(unsigned long sinceMs);
 
 void writeRelayEnergized(bool energized) {
   digitalWrite(kRelayPin, energized ? kRelayEnergizedLevel : kRelayIdleLevel);
@@ -105,6 +132,40 @@ unsigned long currentUvOnMs(unsigned long nowMs) {
     total += elapsedMs(recipe.uvOnSinceMs, nowMs);
   }
   return total;
+}
+
+bool millisAfter(unsigned long value, unsigned long reference) {
+  return static_cast<long>(value - reference) > 0;
+}
+
+void clearSampleHistory() {
+  sampleHistoryStart = 0;
+  sampleHistoryCount = 0;
+}
+
+uint16_t sampleHistoryIndex(uint16_t offset) {
+  return (sampleHistoryStart + offset) % kSampleHistoryCapacity;
+}
+
+void storeSampleHistory(const Max31855Reading& reading, unsigned long sampleMs) {
+  uint16_t index = sampleHistoryIndex(sampleHistoryCount);
+  if (sampleHistoryCount < kSampleHistoryCapacity) {
+    ++sampleHistoryCount;
+  } else {
+    index = sampleHistoryStart;
+    sampleHistoryStart = sampleHistoryIndex(1);
+  }
+
+  sampleHistory[index] = {
+      sampleMs,
+      currentUvOnMs(sampleMs),
+      static_cast<float>(reading.thermocoupleC),
+      static_cast<float>(reading.internalC),
+      reading.raw,
+      reading.faultBits,
+      reading.ok,
+      lampOn,
+  };
 }
 
 const __FlashStringHelper* goalModeName() {
@@ -275,6 +336,10 @@ void emitStatus() {
   line += String(recipe.startMs);
   line += F(",startup=");
   line += recipe.startupHeating ? F("1") : F("0");
+  line += F(",history_count=");
+  line += String(sampleHistoryCount);
+  line += F(",history_capacity=");
+  line += String(kSampleHistoryCapacity);
   emitLine(line);
 }
 
@@ -335,6 +400,7 @@ void startRecipe(double lowerC, double upperC, unsigned long durationS, RecipeGo
   recipe.haveControlTemp = false;
   recipe.lastLampChangeMs = 0;
 
+  clearSampleHistory();
   setRecipeLamp(false, nowMs, true);
   printAck(F("RECIPE_START"));
   emitStatus();
@@ -461,6 +527,16 @@ void processRecipeStart(char* args) {
   startRecipe(lowerC, upperC, durationS, mode);
 }
 
+void processHistorySince(char* args) {
+  unsigned long sinceMs = 0;
+  if (!parseUnsignedLongValue(args, sinceMs)) {
+    printErr(F("BAD_HISTORY_SINCE"));
+    return;
+  }
+
+  emitHistorySince(sinceMs);
+}
+
 void processCommand(char* command) {
   for (char* cursor = command; *cursor != '\0'; ++cursor) {
     if (*cursor >= 'a' && *cursor <= 'z') {
@@ -481,6 +557,8 @@ void processCommand(char* command) {
   } else if (commandsMatch(command, "RECIPE_STOP") || commandsMatch(command, "STOP_RECIPE")) {
     finishRecipe(RecipeLastState::Stopped);
     printAck(F("RECIPE_STOP"));
+  } else if (commandsMatch(command, "HISTORY_SINCE")) {
+    processHistorySince(args);
   } else if (commandsMatch(command, "LAMP_ON") || commandsMatch(command, "ON")) {
     if (recipe.running) {
       printErr(F("RECIPE_RUNNING"));
@@ -542,27 +620,100 @@ void handleBleCommands() {
   processCommand(bleCommandBuffer);
 }
 
-String readingLine(const Max31855Reading& reading, unsigned long sampleMs) {
-  String line(F("DATA,"));
+String sampleLine(
+    const __FlashStringHelper* prefix,
+    unsigned long sampleMs,
+    double thermocoupleC,
+    double internalC,
+    bool ok,
+    uint8_t faultBits,
+    uint32_t raw,
+    bool sampleLampOn,
+    unsigned long uvOnMs) {
+  String line(prefix);
   line.reserve(kBleDataLength);
+  line += ',';
   line += sampleMs;
   line += ',';
-  line += String(reading.thermocoupleC, 2);
+  line += String(thermocoupleC, 2);
   line += ',';
-  line += String(reading.internalC, 2);
+  line += String(internalC, 2);
   line += ',';
-  line += reading.ok ? '1' : '0';
+  line += ok ? '1' : '0';
   line += ',';
-  line += String(reading.faultBits);
+  line += String(faultBits);
   line += F(",0x");
-  appendPaddedHex(line, reading.raw);
+  appendPaddedHex(line, raw);
   line += ',';
-  line += lampOn ? F("ON") : F("OFF");
+  line += sampleLampOn ? F("ON") : F("OFF");
+  line += ',';
+  line += String(uvOnMs);
   return line;
 }
 
+void emitHistorySince(unsigned long sinceMs) {
+  const bool hasHistory = sampleHistoryCount > 0;
+  const unsigned long oldestMs = hasHistory ? sampleHistory[sampleHistoryStart].sampleMs : 0;
+  const unsigned long newestMs =
+      hasHistory ? sampleHistory[sampleHistoryIndex(sampleHistoryCount - 1)].sampleMs : 0;
+  const bool wrapped = sampleHistoryCount == kSampleHistoryCapacity;
+  const bool lost = wrapped && millisAfter(oldestMs, sinceMs);
+
+  String begin(F("HISTORY_BEGIN,since_ms="));
+  begin += String(sinceMs);
+  begin += F(",oldest_ms=");
+  begin += String(oldestMs);
+  begin += F(",newest_ms=");
+  begin += String(newestMs);
+  begin += F(",count=");
+  begin += String(sampleHistoryCount);
+  begin += F(",capacity=");
+  begin += String(kSampleHistoryCapacity);
+  begin += F(",lost=");
+  begin += lost ? F("1") : F("0");
+  emitLine(begin);
+
+  uint16_t sent = 0;
+  for (uint16_t offset = 0; offset < sampleHistoryCount; ++offset) {
+    const SampleRecord& record = sampleHistory[sampleHistoryIndex(offset)];
+    if (!millisAfter(record.sampleMs, sinceMs)) {
+      continue;
+    }
+
+    emitLine(sampleLine(
+        F("HIST"),
+        record.sampleMs,
+        record.thermocoupleC,
+        record.internalC,
+        record.ok,
+        record.faultBits,
+        record.raw,
+        record.lampOn,
+        record.uvOnMs));
+    ++sent;
+
+    if (sent % 4 == 0) {
+      BLE.poll();
+      delay(2);
+    }
+  }
+
+  String end(F("HISTORY_END,sent="));
+  end += String(sent);
+  emitLine(end);
+}
+
 void printReading(const Max31855Reading& reading, unsigned long sampleMs) {
-  emitLine(readingLine(reading, sampleMs));
+  emitLine(sampleLine(
+      F("DATA"),
+      sampleMs,
+      reading.thermocoupleC,
+      reading.internalC,
+      reading.ok,
+      reading.faultBits,
+      reading.raw,
+      lampOn,
+      currentUvOnMs(sampleMs)));
 }
 
 void handleBleConnected(BLEDevice central) {
@@ -649,7 +800,11 @@ void loop() {
   if (lastSampleMs == 0 || elapsedMs(lastSampleMs, now) >= kSamplePeriodMs) {
     lastSampleMs = now;
     const Max31855Reading reading = readMax31855();
+    const bool wasRecipeRunning = recipe.running;
     applyRecipeControl(reading, now);
+    if (wasRecipeRunning || recipe.running) {
+      storeSampleHistory(reading, now);
+    }
     printReading(reading, now);
   }
 }

@@ -43,6 +43,7 @@ class Sample:
     fault_bits: int
     raw: str
     lamp: str
+    uv_on_s: float | None = None
 
 
 class TrendPlot(ttk.Frame):
@@ -251,11 +252,17 @@ class UVLampControllerApp(tk.Tk):
         self.connection_queue: queue.Queue[tuple[str, str]] = queue.Queue()
 
         self.samples: list[Sample] = []
+        self.sample_arduino_ms_seen: set[int] = set()
         self.control_filter_values: list[float] = []
         self.running = False
         self.run_start = 0.0
         self.sample_zero_arduino_ms: int | None = None
         self.sample_zero_wall_time: dt.datetime | None = None
+        self.last_sample_arduino_ms: int | None = None
+        self.history_replay_since_ms: int | None = None
+        self.last_history_request_since_ms: int | None = None
+        self.pending_finish_reason: str | None = None
+        self.pending_finish_lamp_state: str | None = None
         self.timer_end = 0.0
         self.goal_duration_s = 0
         self.uv_on_accumulated_s = 0.0
@@ -590,6 +597,10 @@ class UVLampControllerApp(tk.Tk):
             self.connection_queue.put(("error", "BLE disconnected"))
 
     def disconnect_connection(self, reason: str, release_lamp: bool = False) -> None:
+        if self.running and self.last_sample_arduino_ms is not None:
+            self.history_replay_since_ms = self.last_sample_arduino_ms
+            self.last_history_request_since_ms = None
+
         if release_lamp and not self.running and self._is_connected():
             self.set_lamp(True, force=True)
             if self._is_ble_connected():
@@ -669,7 +680,8 @@ class UVLampControllerApp(tk.Tk):
         self.manual_on_button.state(manual_state)
         self.manual_off_button.state(manual_state)
         if self.running:
-            self.stop_button.state(["!disabled"] if connected else ["disabled"])
+            stop_state = ["!disabled"] if connected and self.pending_finish_reason is None else ["disabled"]
+            self.stop_button.state(stop_state)
 
     def _open_run_log(self) -> None:
         if self.csv_handle is not None:
@@ -734,6 +746,7 @@ class UVLampControllerApp(tk.Tk):
         self._clear_connection_queue()
 
         self.samples.clear()
+        self.sample_arduino_ms_seen.clear()
         self.control_filter_values.clear()
         for item in self.table.get_children():
             self.table.delete(item)
@@ -749,6 +762,11 @@ class UVLampControllerApp(tk.Tk):
         self.run_start = time.monotonic()
         self.sample_zero_arduino_ms = None
         self.sample_zero_wall_time = None
+        self.last_sample_arduino_ms = None
+        self.history_replay_since_ms = None
+        self.last_history_request_since_ms = None
+        self.pending_finish_reason = None
+        self.pending_finish_lamp_state = None
         self.goal_duration_s = duration_s
         self.timer_end = self.run_start + duration_s
         self.uv_on_accumulated_s = 0.0
@@ -780,6 +798,7 @@ class UVLampControllerApp(tk.Tk):
 
         self._clear_connection_queue()
         self.samples.clear()
+        self.sample_arduino_ms_seen.clear()
         self.control_filter_values.clear()
         for item in self.table.get_children():
             self.table.delete(item)
@@ -790,6 +809,11 @@ class UVLampControllerApp(tk.Tk):
         self.goal_duration_s = 0
         self.sample_zero_arduino_ms = None
         self.sample_zero_wall_time = None
+        self.last_sample_arduino_ms = None
+        self.history_replay_since_ms = None
+        self.last_history_request_since_ms = None
+        self.pending_finish_reason = None
+        self.pending_finish_lamp_state = None
         self.uv_on_accumulated_s = 0.0
         self.uv_on_since_s = None
         self.startup_heating = False
@@ -823,6 +847,8 @@ class UVLampControllerApp(tk.Tk):
         self._cancel_scheduled_reconnect()
         self.running = False
         self.startup_heating = False
+        self.pending_finish_reason = None
+        self.pending_finish_lamp_state = None
         self.uv_timer_var.set(self._format_duration(self._current_uv_on_s()))
         self._close_run_log()
 
@@ -972,7 +998,12 @@ class UVLampControllerApp(tk.Tk):
             if self.running:
                 sample = self._parse_sample(line)
                 if sample is not None:
-                    self._record_sample(sample)
+                    self._record_sample(sample, live=True)
+        elif line.startswith("HIST,"):
+            if self.running:
+                sample = self._parse_sample(line)
+                if sample is not None:
+                    self._record_sample(sample, live=False)
         elif line == "READY":
             self.status_var.set("Device ready")
             self._send_command("STATUS")
@@ -980,6 +1011,10 @@ class UVLampControllerApp(tk.Tk):
             self._handle_status_line(line)
         elif line.startswith("RECIPE,"):
             self._handle_recipe_event(line)
+        elif line.startswith("HISTORY_BEGIN,"):
+            self._handle_history_begin(line)
+        elif line.startswith("HISTORY_END,"):
+            self._handle_history_end(line)
         elif line.startswith("ACK,"):
             self.status_var.set(line.replace(",", ": ", 1))
         elif line.startswith("ERR,"):
@@ -1025,8 +1060,26 @@ class UVLampControllerApp(tk.Tk):
         if self.running:
             last_state = values.get("last")
             reason = "Recipe complete" if last_state == "COMPLETE" else "Recipe stopped on Arduino"
-            self._finish_local_run(reason, lamp_state=lamp if lamp in {"ON", "OFF"} else "OFF")
+            lamp_state = lamp if lamp in {"ON", "OFF"} else "OFF"
+            self.pending_finish_reason = reason
+            self.pending_finish_lamp_state = lamp_state
+            if self._request_history_replay(force=True):
+                self.status_var.set(f"{reason}; replaying buffered data")
+                return
+            self._finish_local_run(reason, lamp_state=lamp_state)
         elif recipe_state == "IDLE":
+            last_state = values.get("last")
+            history_count = self._int_value(values, "history_count") or 0
+            if last_state == "COMPLETE" and history_count > 0 and not self.samples:
+                self.running = True
+                self.pending_finish_reason = "Recovered completed recipe"
+                self.pending_finish_lamp_state = lamp if lamp in {"ON", "OFF"} else "OFF"
+                self._open_run_log()
+                self._sync_idle_recipe_metadata(values)
+                if self._request_history_replay(force=True):
+                    return
+                self._finish_local_run(self.pending_finish_reason, lamp_state=self.pending_finish_lamp_state)
+                return
             self.status_var.set("Connected; device idle")
 
     def _handle_recipe_event(self, line: str) -> None:
@@ -1042,6 +1095,27 @@ class UVLampControllerApp(tk.Tk):
         elif line.startswith("RECIPE,STOPPED"):
             self._finish_local_run("Recipe stopped on Arduino", lamp_state="OFF")
 
+    def _handle_history_begin(self, line: str) -> None:
+        values = self._parse_key_values(line)
+        lost = values.get("lost") == "1"
+        count = values.get("count", "?")
+        capacity = values.get("capacity", "?")
+        if lost:
+            self.status_var.set(f"Replaying buffered data; oldest samples were overwritten ({count}/{capacity})")
+        else:
+            self.status_var.set(f"Replaying buffered data ({count}/{capacity})")
+
+    def _handle_history_end(self, line: str) -> None:
+        values = self._parse_key_values(line)
+        sent = values.get("sent", "0")
+        self.history_replay_since_ms = None
+        if self.pending_finish_reason is not None:
+            reason = self.pending_finish_reason
+            lamp_state = self.pending_finish_lamp_state or "OFF"
+            self._finish_local_run(reason, lamp_state=lamp_state)
+            return
+        self.status_var.set(f"Replayed {sent} buffered sample(s)")
+
     def _sync_running_recipe(self, values: dict[str, str]) -> None:
         now = time.monotonic()
         elapsed_s = self._float_value(values, "elapsed_s") or 0.0
@@ -1056,6 +1130,7 @@ class UVLampControllerApp(tk.Tk):
 
         if not self.running:
             self.samples.clear()
+            self.sample_arduino_ms_seen.clear()
             self.control_filter_values.clear()
             for item in self.table.get_children():
                 self.table.delete(item)
@@ -1064,6 +1139,8 @@ class UVLampControllerApp(tk.Tk):
             self._open_run_log()
 
         self.running = True
+        self.pending_finish_reason = None
+        self.pending_finish_lamp_state = None
         self.run_start = now - elapsed_s
         self.goal_duration_s = duration_s if duration_s is not None else self.goal_duration_s
         if remaining_s is not None:
@@ -1082,8 +1159,11 @@ class UVLampControllerApp(tk.Tk):
         if lower is not None and upper is not None and lower < upper:
             self.plot.set_limits(lower, upper)
 
-        self.sample_zero_arduino_ms = start_ms
-        self.sample_zero_wall_time = dt.datetime.now() - dt.timedelta(seconds=elapsed_s)
+        if self.sample_zero_arduino_ms is None or self.sample_zero_wall_time is None:
+            self.sample_zero_arduino_ms = start_ms
+            self.sample_zero_wall_time = dt.datetime.now() - dt.timedelta(seconds=elapsed_s)
+        elif start_ms is not None:
+            self.sample_zero_arduino_ms = start_ms
         self.uv_on_accumulated_s = uv_on_s
         self.uv_on_since_s = now if lamp == "ON" else None
         self.last_lamp_command = lamp if lamp in {"ON", "OFF"} else self.last_lamp_command
@@ -1097,6 +1177,57 @@ class UVLampControllerApp(tk.Tk):
         if remaining_s is not None:
             self.timer_var.set(self._format_duration(remaining_s))
         self._start_timer_updates()
+        self._request_history_replay()
+
+    def _sync_idle_recipe_metadata(self, values: dict[str, str]) -> None:
+        elapsed_s = self._float_value(values, "elapsed_s") or 0.0
+        uv_on_s = self._float_value(values, "uv_on_s") or 0.0
+        duration_s = self._int_value(values, "duration_s")
+        lower = self._float_value(values, "lower")
+        upper = self._float_value(values, "upper")
+        start_ms = self._int_value(values, "start_ms")
+        mode = values.get("mode", "TOTAL").lower()
+
+        if mode in {"total", "uv"}:
+            self.goal_mode_var.set(mode)
+        if duration_s is not None:
+            self.goal_duration_s = duration_s
+            self._set_timer_fields(duration_s)
+            self.timer_var.set(self._format_duration(0))
+        if lower is not None:
+            self.lower_var.set(f"{lower:.2f}")
+        if upper is not None:
+            self.upper_var.set(f"{upper:.2f}")
+        if lower is not None and upper is not None and lower < upper:
+            self.plot.set_limits(lower, upper)
+
+        self.sample_zero_arduino_ms = start_ms
+        self.sample_zero_wall_time = dt.datetime.now() - dt.timedelta(seconds=elapsed_s)
+        self.uv_on_accumulated_s = uv_on_s
+        self.uv_on_since_s = None
+        self.uv_timer_var.set(self._format_duration(uv_on_s))
+        self.history_replay_since_ms = 0
+        self.start_button.state(["disabled"])
+        self.stop_button.state(["disabled"])
+        self._update_connection_controls()
+
+    def _request_history_replay(self, force: bool = False) -> bool:
+        if not self.running or not self._is_connected():
+            return False
+
+        if self.history_replay_since_ms is not None:
+            since_ms = self.history_replay_since_ms
+        elif force or not self.samples:
+            since_ms = 0
+        else:
+            return False
+
+        if self.last_history_request_since_ms == since_ms:
+            return False
+
+        self.last_history_request_since_ms = since_ms
+        self._send_command(f"HISTORY_SINCE,{since_ms}")
+        return True
 
     def _set_timer_fields(self, duration_s: int) -> None:
         hours, remainder = divmod(max(0, duration_s), 3600)
@@ -1107,11 +1238,14 @@ class UVLampControllerApp(tk.Tk):
 
     def _parse_sample(self, line: str) -> Sample | None:
         parts = line.split(",")
-        if len(parts) != 8:
+        if len(parts) not in {8, 9}:
             return None
         try:
             arduino_ms = int(parts[1])
             wall_time, elapsed_s = self._sample_timing(arduino_ms)
+            uv_on_s = None
+            if len(parts) == 9:
+                uv_on_s = int(parts[8]) / 1000.0
             return Sample(
                 wall_time=wall_time,
                 elapsed_s=elapsed_s,
@@ -1122,6 +1256,7 @@ class UVLampControllerApp(tk.Tk):
                 fault_bits=int(parts[5]),
                 raw=parts[6],
                 lamp=parts[7],
+                uv_on_s=uv_on_s,
             )
         except ValueError:
             return None
@@ -1139,11 +1274,19 @@ class UVLampControllerApp(tk.Tk):
     def _millis_delta_ms(start_ms: int, current_ms: int) -> int:
         return (current_ms - start_ms) & 0xFFFFFFFF
 
-    def _record_sample(self, sample: Sample) -> None:
+    def _record_sample(self, sample: Sample, live: bool) -> None:
+        if sample.arduino_ms in self.sample_arduino_ms_seen:
+            return
+
+        self.sample_arduino_ms_seen.add(sample.arduino_ms)
         self.samples.append(sample)
-        self._sync_lamp_from_sample(sample)
+        self.samples.sort(key=lambda item: item.elapsed_s)
+        if live:
+            self._sync_lamp_from_sample(sample)
+            self.last_sample_arduino_ms = sample.arduino_ms
+
         control_temp = self._update_control_filter(sample)
-        uv_on_s = self._current_uv_on_s()
+        uv_on_s = sample.uv_on_s if sample.uv_on_s is not None else self._current_uv_on_s()
         if self.csv_writer is not None and self.csv_handle is not None:
             self.csv_writer.writerow(
                 [
@@ -1165,41 +1308,62 @@ class UVLampControllerApp(tk.Tk):
 
         self.current_temp_var.set(f"{sample.thermocouple_c:.2f} C")
         self.internal_temp_var.set(f"{sample.internal_c:.2f} C")
-
-        fault_text = "OK" if sample.ok else f"Fault {sample.fault_bits}"
-        control_text = "--" if control_temp is None else f"{control_temp:.2f}"
-        self.table.insert(
-            "",
-            0,
-            values=(
-                sample.wall_time.strftime("%H:%M:%S"),
-                TrendPlot._format_elapsed(sample.elapsed_s),
-                self._format_duration(uv_on_s),
-                f"{sample.thermocouple_c:.2f}",
-                control_text,
-                f"{sample.internal_c:.2f}",
-                sample.lamp,
-                fault_text,
-            ),
-        )
-        rows = self.table.get_children()
-        if len(rows) > 250:
-            self.table.delete(rows[-1])
-
+        self._refresh_sample_table()
         self.plot.set_samples(self.samples)
+
+    def _refresh_sample_table(self) -> None:
+        for item in self.table.get_children():
+            self.table.delete(item)
+
+        for sample in sorted(self.samples, key=lambda item: item.elapsed_s, reverse=True)[:250]:
+            control_temp = self._control_average_at(sample)
+            uv_on_s = sample.uv_on_s if sample.uv_on_s is not None else self._current_uv_on_s()
+            fault_text = "OK" if sample.ok else f"Fault {sample.fault_bits}"
+            control_text = "--" if control_temp is None else f"{control_temp:.2f}"
+            self.table.insert(
+                "",
+                "end",
+                values=(
+                    sample.wall_time.strftime("%H:%M:%S"),
+                    TrendPlot._format_elapsed(sample.elapsed_s),
+                    self._format_duration(uv_on_s),
+                    f"{sample.thermocouple_c:.2f}",
+                    control_text,
+                    f"{sample.internal_c:.2f}",
+                    sample.lamp,
+                    fault_text,
+                ),
+            )
+
+    def _control_average_at(self, target: Sample) -> float | None:
+        valid_values: list[float] = []
+        window_size = self._filter_window_size()
+        for sample in self.samples:
+            if not sample.ok or not math.isfinite(sample.thermocouple_c):
+                continue
+            valid_values.append(sample.thermocouple_c)
+            if len(valid_values) > window_size:
+                del valid_values[:-window_size]
+            if sample is target:
+                return sum(valid_values) / len(valid_values)
+        return None
 
     def _sync_lamp_from_sample(self, sample: Sample) -> None:
         lamp_state = "ON" if sample.lamp == "ON" else "OFF"
         now = time.monotonic()
+        if sample.uv_on_s is not None and sample.uv_on_s >= self.uv_on_accumulated_s:
+            self.uv_on_accumulated_s = sample.uv_on_s
+            self.uv_on_since_s = now if lamp_state == "ON" else None
         if self.last_lamp_command is None:
             self.last_lamp_command = lamp_state
-            if lamp_state == "ON" and self.uv_on_since_s is None:
+            if sample.uv_on_s is None and lamp_state == "ON" and self.uv_on_since_s is None:
                 self.uv_on_since_s = now
             self.lamp_var.set(lamp_state)
             return
 
         if lamp_state != self.last_lamp_command:
-            self._track_uv_lamp_transition(lamp_state == "ON", now)
+            if sample.uv_on_s is None:
+                self._track_uv_lamp_transition(lamp_state == "ON", now)
             self.last_lamp_change_s = now
             self.last_lamp_command = lamp_state
         self.lamp_var.set(lamp_state)
