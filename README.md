@@ -87,17 +87,18 @@ Each run creates `data/uv_lamp_log_YYYYMMDD_HHMMSS.csv`.
 
    `Start` uploads a new recipe to the Arduino, clears the live table and plot,
    creates a CSV log, and enters warm-up control on the board. `Stop` sends
-   `RECIPE_STOP`, turns the lamp OFF, and closes the active log after the
-   Arduino reports that it stopped. If the laptop disconnects during a run, the
-   recipe continues on the Arduino; reconnect to monitor or stop it.
-   Disconnecting or closing the app does not send a lamp command, and closing
-   the app during a run detaches from the recipe instead of stopping it.
+   `RECIPE_STOP`, returns the board to its idle lamp-ON default, and closes the
+   active log after the Arduino reports that it stopped. If the laptop
+   disconnects during a run, the recipe continues on the Arduino until its set
+   time; reconnect to monitor or stop it. Disconnecting or closing the app
+   during a run detaches from the recipe instead of stopping it.
 
 5. Use manual lamp control
 
    When connected and not running a recipe, `Lamp ON` and `Lamp OFF` send direct
-   commands. Manual buttons are disabled during a run so automatic temperature
-   control owns the lamp state.
+   commands. The idle default is lamp ON, and an idle BLE disconnect releases
+   the lamp back to ON. Manual buttons are disabled during a run so automatic
+   temperature control owns the lamp state.
 
 6. Monitor live data
 
@@ -152,9 +153,24 @@ but lamp OFF is always applied immediately.
 recipe:
 
 ```text
-STATUS,relay_pin=7,lamp=ON,last_lamp_ms=12340,last_lamp_reason=LOWER,ble=CONNECTED,recipe=RUNNING,last=NONE,mode=TOTAL,lower=26.00,upper=30.00,duration_s=1800,elapsed_s=120,uv_on_s=82,remaining_s=1680,start_ms=12345,startup=0,history_count=120,history_capacity=600
+STATUS,relay_pin=7,relay_energized=HIGH,relay_idle=LOW,relay_signal=LOW,lamp=ON,last_lamp_ms=12340,last_lamp_reason=LOWER,ble=CONNECTED,recipe=RUNNING,last=NONE,mode=TOTAL,lower=26.00,upper=30.00,duration_s=1800,uv_on_s=82,remaining_s=1680,start_ms=12345,startup=0,history_count=120,history_capacity=600
 ```
 
 `arduino_ms` should be captured when the thermocouple is read. The plot and CSV
 `elapsed_s` use that device timestamp, so BLE notification delay does not shift
 individual datapoints.
+
+To test the relay over USB serial while no recipe is running, open a 115200 baud
+serial monitor and send:
+
+```text
+STATUS
+LAMP_OFF
+STATUS
+LAMP_ON
+STATUS
+```
+
+`LAMP_OFF` should report `lamp=OFF` and `relay_signal` equal to
+`relay_energized`; `LAMP_ON` should report `lamp=ON` and `relay_signal` equal
+to `relay_idle`.

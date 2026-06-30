@@ -9,8 +9,9 @@ constexpr uint8_t kMax31855CsPin = 10;
 constexpr uint8_t kRelayPin = 7;
 constexpr uint32_t kMax31855SpiHz = 4000000;
 constexpr unsigned long kSamplePeriodMs = 1000;
-constexpr uint8_t kRelayEnergizedLevel = HIGH;  // Relay module H/L selector is set to H.
-constexpr uint8_t kRelayIdleLevel = LOW;
+constexpr bool kRelayInputActiveHigh = true;  // Set false for relay modules using an active-LOW input.
+constexpr uint8_t kRelayEnergizedLevel = kRelayInputActiveHigh ? HIGH : LOW;
+constexpr uint8_t kRelayIdleLevel = kRelayInputActiveHigh ? LOW : HIGH;
 constexpr char kBleLocalName[] = "ThermoCouple";
 constexpr char kBleServiceUuid[] = "7f3fd100-9a7e-4f4f-a5f1-f6c5437fd801";
 constexpr char kBleDataUuid[] = "7f3fd101-9a7e-4f4f-a5f1-f6c5437fd801";
@@ -111,8 +112,8 @@ void writeRelayEnergized(bool energized) {
 }
 
 void setLamp(bool on, const char* reason = "DIRECT") {
-  // The lamp should be wired through COM and NC so it is on when the relay is idle.
-  // Energizing the relay opens NC, which turns the lamp off.
+  // The lamp is wired through COM and NC, so idle relay means lamp on.
+  // Energizing the relay opens NC, turning the lamp off.
   lampOn = on;
   lastLampSetMs = millis();
   lastLampReason = reason;
@@ -307,6 +308,10 @@ bool commandsMatch(const char* command, const char* target) {
   return strcmp(command, target) == 0;
 }
 
+const __FlashStringHelper* levelName(uint8_t level) {
+  return level == HIGH ? F("HIGH") : F("LOW");
+}
+
 void emitStatus() {
   const unsigned long nowMs = millis();
   const unsigned long elapsedS = recipe.running ? recipeElapsedMs(nowMs) / 1000UL : 0;
@@ -314,6 +319,12 @@ void emitStatus() {
 
   String line(F("STATUS,relay_pin="));
   line += String(kRelayPin);
+  line += F(",relay_energized=");
+  line += levelName(kRelayEnergizedLevel);
+  line += F(",relay_idle=");
+  line += levelName(kRelayIdleLevel);
+  line += F(",relay_signal=");
+  line += levelName(digitalRead(kRelayPin));
   line += F(",lamp=");
   line += lampOn ? F("ON") : F("OFF");
   line += F(",last_lamp_ms=");
@@ -428,7 +439,7 @@ void emitRecipeDone(RecipeLastState lastState) {
 void finishRecipe(RecipeLastState lastState) {
   if (!recipe.running) {
     recipe.lastState = lastState;
-    setLamp(false, "STOP_IDLE");
+    setLamp(true, "IDLE_DEFAULT");
     emitStatus();
     return;
   }
@@ -439,6 +450,7 @@ void finishRecipe(RecipeLastState lastState) {
   recipe.running = false;
   recipe.startupHeating = false;
   recipe.lastState = lastState;
+  setLamp(true, "IDLE_DEFAULT");
   emitStatus();
 }
 
@@ -740,7 +752,8 @@ void handleBleDisconnected(BLEDevice central) {
   if (recipe.running) {
     Serial.println(F("BLE,RECIPE_CONTINUES"));
   } else {
-    Serial.println(F("BLE,STATE_HELD"));
+    setLamp(true, "BLE_DISCONNECT_IDLE");
+    Serial.println(F("BLE,IDLE_DEFAULT_ON"));
   }
 
   if (BLE.advertise()) {
@@ -796,7 +809,11 @@ void setup() {
 
   Serial.println(F("UNO R4 WiFi MAX31855 thermocouple reader"));
   Serial.println(F("CS=D10, DO/SO=CIPO, CLK/SCK=RSPCKA"));
-  Serial.println(F("Relay signal=D7, lamp defaults ON"));
+  Serial.print(F("Relay signal=D7, energized="));
+  Serial.print(levelName(kRelayEnergizedLevel));
+  Serial.print(F(", idle="));
+  Serial.print(levelName(kRelayIdleLevel));
+  Serial.println(F(", lamp defaults ON"));
   Serial.println(F("READY"));
 }
 
