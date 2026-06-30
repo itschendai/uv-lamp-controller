@@ -91,6 +91,8 @@ RecipeState recipe;
 SampleRecord sampleHistory[kSampleHistoryCapacity];
 uint16_t sampleHistoryStart = 0;
 uint16_t sampleHistoryCount = 0;
+unsigned long lastLampSetMs = 0;
+const char* lastLampReason = "BOOT";
 
 String sampleLine(
     const __FlashStringHelper* prefix,
@@ -108,10 +110,12 @@ void writeRelayEnergized(bool energized) {
   digitalWrite(kRelayPin, energized ? kRelayEnergizedLevel : kRelayIdleLevel);
 }
 
-void setLamp(bool on) {
+void setLamp(bool on, const char* reason = "DIRECT") {
   // The lamp should be wired through COM and NC so it is on when the relay is idle.
   // Energizing the relay opens NC, which turns the lamp off.
   lampOn = on;
+  lastLampSetMs = millis();
+  lastLampReason = reason;
   writeRelayEnergized(!on);
 }
 
@@ -211,12 +215,12 @@ void trackRecipeLampTransition(bool on, unsigned long nowMs) {
   }
 }
 
-void setRecipeLamp(bool on, unsigned long nowMs, bool force = false) {
+void setRecipeLamp(bool on, unsigned long nowMs, bool force = false, const char* reason = "CONTROL") {
   if (!force && lampOn == on) {
     return;
   }
 
-  if (!force && recipe.lastLampChangeMs != 0 && elapsedMs(recipe.lastLampChangeMs, nowMs) < kMinRelayDwellMs) {
+  if (!force && on && recipe.lastLampChangeMs != 0 && elapsedMs(recipe.lastLampChangeMs, nowMs) < kMinRelayDwellMs) {
     return;
   }
 
@@ -224,7 +228,7 @@ void setRecipeLamp(bool on, unsigned long nowMs, bool force = false) {
     trackRecipeLampTransition(on, nowMs);
     recipe.lastLampChangeMs = nowMs;
   }
-  setLamp(on);
+  setLamp(on, reason);
 }
 
 uint32_t readMax31855Raw() {
@@ -312,6 +316,10 @@ void emitStatus() {
   line += String(kRelayPin);
   line += F(",lamp=");
   line += lampOn ? F("ON") : F("OFF");
+  line += F(",last_lamp_ms=");
+  line += String(lastLampSetMs);
+  line += F(",last_lamp_reason=");
+  line += lastLampReason;
   line += F(",ble=");
   line += bleConnected ? F("CONNECTED") : F("DISCONNECTED");
   line += F(",recipe=");
@@ -401,7 +409,7 @@ void startRecipe(double lowerC, double upperC, unsigned long durationS, RecipeGo
   recipe.lastLampChangeMs = 0;
 
   clearSampleHistory();
-  setRecipeLamp(false, nowMs, true);
+  setRecipeLamp(false, nowMs, true, "START_OFF");
   printAck(F("RECIPE_START"));
   emitStatus();
 }
@@ -420,13 +428,13 @@ void emitRecipeDone(RecipeLastState lastState) {
 void finishRecipe(RecipeLastState lastState) {
   if (!recipe.running) {
     recipe.lastState = lastState;
-    setLamp(false);
+    setLamp(false, "STOP_IDLE");
     emitStatus();
     return;
   }
 
   const unsigned long nowMs = millis();
-  setRecipeLamp(false, nowMs, true);
+  setRecipeLamp(false, nowMs, true, lastState == RecipeLastState::Complete ? "COMPLETE" : "STOP");
   emitRecipeDone(lastState);
   recipe.running = false;
   recipe.startupHeating = false;
@@ -474,20 +482,20 @@ void applyRecipeControl(const Max31855Reading& reading, unsigned long sampleMs) 
 
   if (!reading.ok) {
     recipe.startupHeating = false;
-    setRecipeLamp(false, sampleMs, true);
+    setRecipeLamp(false, sampleMs, true, "FAULT");
   } else if (!haveControlTemp) {
-    setRecipeLamp(false, sampleMs, true);
+    setRecipeLamp(false, sampleMs, true, "NO_CONTROL");
   } else if (recipe.startupHeating) {
     if (recipe.lastControlC >= recipe.upperC) {
       recipe.startupHeating = false;
-      setRecipeLamp(false, sampleMs, true);
+      setRecipeLamp(false, sampleMs, true, "UPPER");
     } else {
-      setRecipeLamp(true, sampleMs);
+      setRecipeLamp(true, sampleMs, false, "WARMUP");
     }
   } else if (recipe.lastControlC <= recipe.lowerC) {
-    setRecipeLamp(true, sampleMs);
+    setRecipeLamp(true, sampleMs, false, "LOWER");
   } else if (recipe.lastControlC >= recipe.upperC) {
-    setRecipeLamp(false, sampleMs);
+    setRecipeLamp(false, sampleMs, false, "UPPER");
   }
 
   if (recipe.running && recipe.goalMode == RecipeGoalMode::Uv && currentUvOnMs(sampleMs) >= targetMs) {
@@ -563,14 +571,14 @@ void processCommand(char* command) {
     if (recipe.running) {
       printErr(F("RECIPE_RUNNING"));
     } else {
-      setLamp(true);
+      setLamp(true, "MANUAL_ON");
       printAck(F("LAMP_ON"));
     }
   } else if (commandsMatch(command, "LAMP_OFF") || commandsMatch(command, "OFF")) {
     if (recipe.running) {
       printErr(F("RECIPE_RUNNING"));
     } else {
-      setLamp(false);
+      setLamp(false, "MANUAL_OFF");
       printAck(F("LAMP_OFF"));
     }
   } else if (commandsMatch(command, "STATUS") || commandsMatch(command, "RECIPE_STATUS")) {
@@ -773,7 +781,7 @@ void setupBle() {
 void setup() {
   digitalWrite(kRelayPin, kRelayIdleLevel);
   pinMode(kRelayPin, OUTPUT);
-  setLamp(true);
+  setLamp(true, "BOOT");
 
   pinMode(kMax31855CsPin, OUTPUT);
   digitalWrite(kMax31855CsPin, HIGH);

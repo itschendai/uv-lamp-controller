@@ -8,6 +8,7 @@ import queue
 import threading
 import time
 import tkinter as tk
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from tkinter import messagebox, ttk
@@ -30,6 +31,8 @@ DATA_DIR = PROJECT_DIR / "data"
 DEFAULT_CONTROL_AVERAGE_SAMPLES = 5
 DEFAULT_MIN_RELAY_DWELL_S = 1.0
 BLE_RECONNECT_DELAY_MS = 5000
+BLE_COMMAND_TIMEOUT_MS = 5000
+BLE_HISTORY_COMMAND_TIMEOUT_MS = 30000
 
 
 @dataclass
@@ -250,6 +253,9 @@ class UVLampControllerApp(tk.Tk):
         self.auto_reconnect_after_id: str | None = None
         self.timer_polling = False
         self.connection_queue: queue.Queue[tuple[str, str]] = queue.Queue()
+        self.ble_command_queue: deque[str] = deque()
+        self.ble_command_in_flight: str | None = None
+        self.ble_command_timeout_after_id: str | None = None
 
         self.samples: list[Sample] = []
         self.sample_arduino_ms_seen: set[int] = set()
@@ -263,6 +269,7 @@ class UVLampControllerApp(tk.Tk):
         self.last_history_request_since_ms: int | None = None
         self.pending_finish_reason: str | None = None
         self.pending_finish_lamp_state: str | None = None
+        self.pending_stop_reason: str | None = None
         self.timer_end = 0.0
         self.goal_duration_s = 0
         self.uv_on_accumulated_s = 0.0
@@ -507,6 +514,7 @@ class UVLampControllerApp(tk.Tk):
             return False
 
         self._cancel_scheduled_reconnect()
+        self._reset_ble_command_queue()
         self._clear_connection_queue()
         self.stop_event.clear()
         self.ble_connected_event.clear()
@@ -624,6 +632,9 @@ class UVLampControllerApp(tk.Tk):
         self.ble_connect_error = None
         self.connected_port = None
         self.reader_thread = None
+        self._reset_ble_command_queue()
+        if self.running:
+            self.pending_stop_reason = None
         if not self.running:
             self.last_lamp_command = None
             self.lamp_var.set("ON" if release_lamp else "OFF")
@@ -647,6 +658,16 @@ class UVLampControllerApp(tk.Tk):
             except Exception:
                 pass
             self.auto_reconnect_after_id = None
+
+    def _reset_ble_command_queue(self) -> None:
+        self.ble_command_queue.clear()
+        self.ble_command_in_flight = None
+        if self.ble_command_timeout_after_id is not None:
+            try:
+                self.after_cancel(self.ble_command_timeout_after_id)
+            except Exception:
+                pass
+            self.ble_command_timeout_after_id = None
 
     def _schedule_recipe_reconnect(self) -> None:
         if not self.running or self._is_connected() or self.auto_reconnect_after_id is not None:
@@ -680,7 +701,7 @@ class UVLampControllerApp(tk.Tk):
         self.manual_on_button.state(manual_state)
         self.manual_off_button.state(manual_state)
         if self.running:
-            stop_state = ["!disabled"] if connected and self.pending_finish_reason is None else ["disabled"]
+            stop_state = ["!disabled"] if connected and self.pending_finish_reason is None and self.pending_stop_reason is None else ["disabled"]
             self.stop_button.state(stop_state)
 
     def _open_run_log(self) -> None:
@@ -767,6 +788,7 @@ class UVLampControllerApp(tk.Tk):
         self.last_history_request_since_ms = None
         self.pending_finish_reason = None
         self.pending_finish_lamp_state = None
+        self.pending_stop_reason = None
         self.goal_duration_s = duration_s
         self.timer_end = self.run_start + duration_s
         self.uv_on_accumulated_s = 0.0
@@ -783,7 +805,6 @@ class UVLampControllerApp(tk.Tk):
 
         mode = self.goal_mode_var.get().upper()
         self._send_command(f"RECIPE_START,{lower:.3f},{upper:.3f},{duration_s},{mode}")
-        self._send_command("STATUS")
         self._start_timer_updates()
 
     def reset_run(self) -> None:
@@ -814,6 +835,7 @@ class UVLampControllerApp(tk.Tk):
         self.last_history_request_since_ms = None
         self.pending_finish_reason = None
         self.pending_finish_lamp_state = None
+        self.pending_stop_reason = None
         self.uv_on_accumulated_s = 0.0
         self.uv_on_since_s = None
         self.startup_heating = False
@@ -849,6 +871,7 @@ class UVLampControllerApp(tk.Tk):
         self.startup_heating = False
         self.pending_finish_reason = None
         self.pending_finish_lamp_state = None
+        self.pending_stop_reason = None
         self.uv_timer_var.set(self._format_duration(self._current_uv_on_s()))
         self._close_run_log()
 
@@ -867,9 +890,10 @@ class UVLampControllerApp(tk.Tk):
             return
 
         if self.running:
+            self.pending_stop_reason = reason
+            self.stop_button.state(["disabled"])
+            self.status_var.set("Stopping recipe on Arduino...")
             self._send_command("RECIPE_STOP")
-            self._send_command("STATUS")
-            self._finish_local_run(reason, lamp_state="OFF")
             return
 
         if self._is_connected():
@@ -926,11 +950,27 @@ class UVLampControllerApp(tk.Tk):
             total += max(0.0, (now or time.monotonic()) - self.uv_on_since_s)
         return total
 
-    def _send_command(self, command: str) -> None:
-        if self._is_ble_connected():
-            self._send_ble_command(command)
+    def _send_command(self, command: str) -> bool:
+        if not self._is_ble_connected():
+            return False
 
-    def _send_ble_command(self, command: str) -> None:
+        self.ble_command_queue.append(command)
+        self._pump_ble_command_queue()
+        return True
+
+    def _pump_ble_command_queue(self) -> None:
+        if self.ble_command_in_flight is not None or not self._is_ble_connected():
+            return
+        if not self.ble_command_queue:
+            return
+
+        command = self.ble_command_queue.popleft()
+        self.ble_command_in_flight = command
+        timeout_ms = BLE_HISTORY_COMMAND_TIMEOUT_MS if command.startswith("HISTORY_SINCE") else BLE_COMMAND_TIMEOUT_MS
+        self.ble_command_timeout_after_id = self.after(timeout_ms, lambda: self._handle_ble_command_timeout(command))
+        self._send_ble_command_now(command)
+
+    def _send_ble_command_now(self, command: str) -> None:
         if self.ble_loop is None or self.ble_client is None:
             return
 
@@ -950,6 +990,49 @@ class UVLampControllerApp(tk.Tk):
                 self.connection_queue.put(("error", f"BLE write failed: {exc}"))
 
         future.add_done_callback(report_result)
+
+    def _handle_ble_command_timeout(self, command: str) -> None:
+        if self.ble_command_in_flight != command:
+            return
+
+        self.ble_command_timeout_after_id = None
+        self.ble_command_in_flight = None
+        if command.startswith("RECIPE_STOP"):
+            self.pending_stop_reason = None
+            self._update_connection_controls()
+        self.status_var.set(f"No Arduino response for {command.split(',', 1)[0]}")
+        self._pump_ble_command_queue()
+
+    def _complete_ble_command_from_line(self, line: str) -> None:
+        command = self.ble_command_in_flight
+        if command is None or not self._line_completes_ble_command(command, line):
+            return
+
+        if self.ble_command_timeout_after_id is not None:
+            try:
+                self.after_cancel(self.ble_command_timeout_after_id)
+            except Exception:
+                pass
+            self.ble_command_timeout_after_id = None
+        self.ble_command_in_flight = None
+        self.after(10, self._pump_ble_command_queue)
+
+    @staticmethod
+    def _line_completes_ble_command(command: str, line: str) -> bool:
+        command_name = command.split(",", 1)[0]
+        if line.startswith("ERR,"):
+            return True
+        if command_name == "STATUS":
+            return line.startswith("STATUS,")
+        if command_name == "HISTORY_SINCE":
+            return line.startswith("HISTORY_END,")
+        if command_name == "RECIPE_STOP":
+            return line == "ACK,RECIPE_STOP" or line.startswith("RECIPE,STOPPED")
+        if command_name == "RECIPE_START":
+            return line == "ACK,RECIPE_START"
+        if command_name in {"LAMP_ON", "LAMP_OFF"}:
+            return line == f"ACK,{command_name}"
+        return line.startswith("ACK,")
 
     def _clear_connection_queue(self) -> None:
         while True:
@@ -1006,7 +1089,6 @@ class UVLampControllerApp(tk.Tk):
                     self._record_sample(sample, live=False)
         elif line == "READY":
             self.status_var.set("Device ready")
-            self._send_command("STATUS")
         elif line.startswith("STATUS,"):
             self._handle_status_line(line)
         elif line.startswith("RECIPE,"):
@@ -1019,6 +1101,8 @@ class UVLampControllerApp(tk.Tk):
             self.status_var.set(line.replace(",", ": ", 1))
         elif line.startswith("ERR,"):
             self.status_var.set(line)
+
+        self._complete_ble_command_from_line(line)
 
     @staticmethod
     def _parse_key_values(line: str) -> dict[str, str]:
@@ -1059,7 +1143,10 @@ class UVLampControllerApp(tk.Tk):
 
         if self.running:
             last_state = values.get("last")
-            reason = "Recipe complete" if last_state == "COMPLETE" else "Recipe stopped on Arduino"
+            if last_state == "COMPLETE":
+                reason = "Recipe complete"
+            else:
+                reason = self.pending_stop_reason or "Recipe stopped on Arduino"
             lamp_state = lamp if lamp in {"ON", "OFF"} else "OFF"
             self.pending_finish_reason = reason
             self.pending_finish_lamp_state = lamp_state
@@ -1093,7 +1180,7 @@ class UVLampControllerApp(tk.Tk):
         if line.startswith("RECIPE,DONE"):
             self._finish_local_run("Recipe complete", lamp_state="OFF")
         elif line.startswith("RECIPE,STOPPED"):
-            self._finish_local_run("Recipe stopped on Arduino", lamp_state="OFF")
+            self._finish_local_run(self.pending_stop_reason or "Recipe stopped on Arduino", lamp_state="OFF")
 
     def _handle_history_begin(self, line: str) -> None:
         values = self._parse_key_values(line)

@@ -87,11 +87,11 @@ Each run creates `data/uv_lamp_log_YYYYMMDD_HHMMSS.csv`.
 
    `Start` uploads a new recipe to the Arduino, clears the live table and plot,
    creates a CSV log, and enters warm-up control on the board. `Stop` sends
-   `RECIPE_STOP`, turns the lamp OFF, and closes the active log. If the laptop
-   disconnects during a run, the recipe continues on the Arduino; reconnect to
-   monitor or stop it. Disconnecting or closing the app does not send a lamp
-   command, and closing the app during a run detaches from the recipe instead of
-   stopping it.
+   `RECIPE_STOP`, turns the lamp OFF, and closes the active log after the
+   Arduino reports that it stopped. If the laptop disconnects during a run, the
+   recipe continues on the Arduino; reconnect to monitor or stop it.
+   Disconnecting or closing the app does not send a lamp command, and closing
+   the app during a run detaches from the recipe instead of stopping it.
 
 5. Use manual lamp control
 
@@ -145,11 +145,14 @@ STATUS
 ```
 
 Manual `LAMP_ON` and `LAMP_OFF` are accepted only while no recipe is running.
+The desktop sends BLE commands one at a time and waits for the Arduino response
+before sending the next command. During a recipe, relay dwell can delay lamp ON,
+but lamp OFF is always applied immediately.
 `STATUS` returns a key/value line that lets the app reattach to an existing
 recipe:
 
 ```text
-STATUS,relay_pin=7,lamp=ON,ble=CONNECTED,recipe=RUNNING,last=NONE,mode=TOTAL,lower=26.00,upper=30.00,duration_s=1800,elapsed_s=120,uv_on_s=82,remaining_s=1680,start_ms=12345,startup=0,history_count=120,history_capacity=600
+STATUS,relay_pin=7,lamp=ON,last_lamp_ms=12340,last_lamp_reason=LOWER,ble=CONNECTED,recipe=RUNNING,last=NONE,mode=TOTAL,lower=26.00,upper=30.00,duration_s=1800,elapsed_s=120,uv_on_s=82,remaining_s=1680,start_ms=12345,startup=0,history_count=120,history_capacity=600
 ```
 
 `arduino_ms` should be captured when the thermocouple is read. The plot and CSV
